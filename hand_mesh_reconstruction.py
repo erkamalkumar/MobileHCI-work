@@ -5,8 +5,21 @@ Implements 3D hand mesh reconstruction using MediaPipe Hands solution
 
 import cv2
 import mediapipe as mp
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
 import numpy as np
 from typing import Optional, List, Tuple
+
+
+# Hand landmark connections for drawing
+HAND_CONNECTIONS = frozenset([
+    (0, 1), (1, 2), (2, 3), (3, 4),  # Thumb
+    (0, 5), (5, 6), (6, 7), (7, 8),  # Index finger
+    (0, 9), (9, 10), (10, 11), (11, 12),  # Middle finger
+    (0, 13), (13, 14), (14, 15), (15, 16),  # Ring finger
+    (0, 17), (17, 18), (18, 19), (19, 20),  # Pinky
+    (5, 9), (9, 13), (13, 17)  # Palm
+])
 
 
 class HandMeshReconstructor:
@@ -29,19 +42,47 @@ class HandMeshReconstructor:
             min_detection_confidence: Minimum confidence for hand detection
             min_tracking_confidence: Minimum confidence for hand tracking
         """
-        self.mp_hands = mp.solutions.hands
-        self.mp_drawing = mp.solutions.drawing_utils
-        self.mp_drawing_styles = mp.solutions.drawing_styles
+        # Create HandLandmarker options
+        base_options = python.BaseOptions(model_asset_path='hand_landmarker.task')
         
-        self.hands = self.mp_hands.Hands(
-            static_image_mode=static_image_mode,
-            max_num_hands=max_num_hands,
-            min_detection_confidence=min_detection_confidence,
+        running_mode = vision.RunningMode.VIDEO if not static_image_mode else vision.RunningMode.IMAGE
+        
+        options = vision.HandLandmarkerOptions(
+            base_options=base_options,
+            running_mode=running_mode,
+            num_hands=max_num_hands,
+            min_hand_detection_confidence=min_detection_confidence,
             min_tracking_confidence=min_tracking_confidence
         )
         
+        self.detector = vision.HandLandmarker.create_from_options(options)
+        self.running_mode = running_mode
+        self.frame_timestamp_ms = 0
+        
         # Define hand mesh connections for visualization
-        self.hand_connections = self.mp_hands.HAND_CONNECTIONS
+        self.hand_connections = HAND_CONNECTIONS
+        
+    def draw_landmarks(self, image: np.ndarray, hand_landmarks: List, color=(0, 255, 0)):
+        """Draw hand landmarks and connections on image."""
+        h, w, _ = image.shape
+        
+        # Convert normalized coordinates to pixel coordinates
+        points = []
+        for landmark in hand_landmarks:
+            x = int(landmark['x'] * w)
+            y = int(landmark['y'] * h)
+            points.append((x, y))
+            # Draw landmark point
+            cv2.circle(image, (x, y), 5, color, -1)
+            cv2.circle(image, (x, y), 7, (255, 255, 255), 2)
+        
+        # Draw connections
+        for connection in self.hand_connections:
+            start_idx, end_idx = connection
+            if start_idx < len(points) and end_idx < len(points):
+                cv2.line(image, points[start_idx], points[end_idx], color, 2)
+        
+        return image
         
     def reconstruct_mesh(self, frame: np.ndarray) -> Tuple[np.ndarray, Optional[dict]]:
         """
@@ -57,40 +98,38 @@ class HandMeshReconstructor:
         # Convert BGR to RGB
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         
+        # Create MediaPipe Image
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+        
         # Process the frame
-        results = self.hands.process(rgb_frame)
+        if self.running_mode == vision.RunningMode.VIDEO:
+            self.frame_timestamp_ms += 33  # ~30 fps
+            results = self.detector.detect_for_video(mp_image, self.frame_timestamp_ms)
+        else:
+            results = self.detector.detect(mp_image)
         
         # Create a copy for annotation
         annotated_frame = frame.copy()
         
         mesh_data = None
         
-        if results.multi_hand_landmarks and results.multi_hand_world_landmarks:
+        if results.hand_landmarks and results.hand_world_landmarks:
             mesh_data = {
                 'hands': [],
-                'count': len(results.multi_hand_landmarks)
+                'count': len(results.hand_landmarks)
             }
             
             for idx, (hand_landmarks, hand_world_landmarks) in enumerate(
-                zip(results.multi_hand_landmarks, results.multi_hand_world_landmarks)
+                zip(results.hand_landmarks, results.hand_world_landmarks)
             ):
-                # Draw the hand mesh with connections
-                self.mp_drawing.draw_landmarks(
-                    annotated_frame,
-                    hand_landmarks,
-                    self.hand_connections,
-                    self.mp_drawing_styles.get_default_hand_landmarks_style(),
-                    self.mp_drawing_styles.get_default_hand_connections_style()
-                )
-                
                 # Extract handedness (left or right)
                 handedness = "Unknown"
-                if results.multi_handedness and idx < len(results.multi_handedness):
-                    handedness = results.multi_handedness[idx].classification[0].label
+                if results.handedness and idx < len(results.handedness):
+                    handedness = results.handedness[idx][0].category_name
                 
                 # Extract normalized landmarks (2D + depth)
                 screen_landmarks = []
-                for landmark in hand_landmarks.landmark:
+                for landmark in hand_landmarks:
                     screen_landmarks.append({
                         'x': landmark.x,
                         'y': landmark.y,
@@ -99,7 +138,7 @@ class HandMeshReconstructor:
                 
                 # Extract world landmarks (3D in real-world coordinates)
                 world_landmarks = []
-                for landmark in hand_world_landmarks.landmark:
+                for landmark in hand_world_landmarks:
                     world_landmarks.append({
                         'x': landmark.x,
                         'y': landmark.y,
@@ -112,6 +151,10 @@ class HandMeshReconstructor:
                     'world_landmarks': world_landmarks,
                     'landmark_count': len(screen_landmarks)
                 })
+                
+                # Draw the hand mesh with connections
+                self.draw_landmarks(annotated_frame, screen_landmarks, 
+                                  color=(255, 0, 0) if handedness == "Left" else (0, 0, 255))
         
         return annotated_frame, mesh_data
     
@@ -131,16 +174,16 @@ class HandMeshReconstructor:
             vertices[i, 0] = landmark['x']
             vertices[i, 1] = landmark['y']
             vertices[i, 2] = landmark['z']
-            
+        
         return vertices
     
     def draw_3d_mesh(self, frame: np.ndarray, mesh_data: dict) -> np.ndarray:
         """
-        Draw enhanced 3D mesh visualization with additional visual cues.
+        Draw enhanced 3D mesh visualization with depth information.
         
         Args:
             frame: Input frame
-            mesh_data: Mesh data from reconstruction
+            mesh_data: Mesh data from reconstruct_mesh
             
         Returns:
             Frame with enhanced mesh visualization
@@ -148,37 +191,43 @@ class HandMeshReconstructor:
         if not mesh_data or 'hands' not in mesh_data:
             return frame
         
-        height, width, _ = frame.shape
+        h, w, _ = frame.shape
         
         for hand_info in mesh_data['hands']:
             landmarks = hand_info['screen_landmarks']
             handedness = hand_info['handedness']
             
-            # Draw palm area (filled polygon)
-            palm_indices = [0, 1, 5, 9, 13, 17]  # Wrist and base of each finger
-            palm_points = []
-            for idx in palm_indices:
-                x = int(landmarks[idx]['x'] * width)
-                y = int(landmarks[idx]['y'] * height)
-                palm_points.append([x, y])
+            # Color based on handedness
+            base_color = (255, 100, 100) if handedness == "Left" else (100, 100, 255)
             
-            palm_points = np.array(palm_points, dtype=np.int32)
-            overlay = frame.copy()
-            cv2.fillPoly(overlay, [palm_points], (100, 150, 100))
-            frame = cv2.addWeighted(frame, 0.7, overlay, 0.3, 0)
+            # Draw filled mesh triangles for better visualization
+            points = []
+            for lm in landmarks:
+                x = int(lm['x'] * w)
+                y = int(lm['y'] * h)
+                points.append([x, y])
             
-            # Add handedness label
-            wrist = landmarks[0]
-            x = int(wrist['x'] * width)
-            y = int(wrist['y'] * height)
-            cv2.putText(frame, f"{handedness} Hand", (x - 50, y - 10),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
+            points = np.array(points, dtype=np.int32)
+            
+            # Draw palm area as filled polygon
+            palm_indices = [0, 1, 5, 9, 13, 17]
+            if len(points) >= max(palm_indices):
+                palm_points = points[palm_indices]
+                overlay = frame.copy()
+                cv2.fillPoly(overlay, [palm_points], base_color)
+                frame = cv2.addWeighted(frame, 0.7, overlay, 0.3, 0)
+            
+            # Draw label
+            wrist = points[0]
+            label = f"{handedness} Hand"
+            cv2.putText(frame, label, (wrist[0], wrist[1] - 10),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, base_color, 2)
         
         return frame
     
     def release(self):
         """Release resources."""
-        self.hands.close()
+        self.detector.close()
 
 
 def main():

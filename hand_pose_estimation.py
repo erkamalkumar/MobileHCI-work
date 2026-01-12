@@ -5,8 +5,21 @@ Implements real-time hand tracking and 3D pose estimation using MediaPipe
 
 import cv2
 import mediapipe as mp
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
 import numpy as np
 from typing import Optional, Tuple, List
+
+
+# Hand landmark connections for drawing
+HAND_CONNECTIONS = frozenset([
+    (0, 1), (1, 2), (2, 3), (3, 4),  # Thumb
+    (0, 5), (5, 6), (6, 7), (7, 8),  # Index finger
+    (0, 9), (9, 10), (10, 11), (11, 12),  # Middle finger
+    (0, 13), (13, 14), (14, 15), (15, 16),  # Ring finger
+    (0, 17), (17, 18), (18, 19), (19, 20),  # Pinky
+    (5, 9), (9, 13), (13, 17)  # Palm
+])
 
 
 class HandPoseEstimator:
@@ -29,16 +42,44 @@ class HandPoseEstimator:
             min_detection_confidence: Minimum confidence for hand detection
             min_tracking_confidence: Minimum confidence for hand tracking
         """
-        self.mp_hands = mp.solutions.hands
-        self.mp_drawing = mp.solutions.drawing_utils
-        self.mp_drawing_styles = mp.solutions.drawing_styles
+        # Create HandLandmarker options
+        base_options = python.BaseOptions(model_asset_path='hand_landmarker.task')
         
-        self.hands = self.mp_hands.Hands(
-            static_image_mode=static_image_mode,
-            max_num_hands=max_num_hands,
-            min_detection_confidence=min_detection_confidence,
+        running_mode = vision.RunningMode.VIDEO if not static_image_mode else vision.RunningMode.IMAGE
+        
+        options = vision.HandLandmarkerOptions(
+            base_options=base_options,
+            running_mode=running_mode,
+            num_hands=max_num_hands,
+            min_hand_detection_confidence=min_detection_confidence,
             min_tracking_confidence=min_tracking_confidence
         )
+        
+        self.detector = vision.HandLandmarker.create_from_options(options)
+        self.running_mode = running_mode
+        self.frame_timestamp_ms = 0
+        
+    def draw_landmarks(self, image: np.ndarray, hand_landmarks: List, color=(0, 255, 0)):
+        """Draw hand landmarks and connections on image."""
+        h, w, _ = image.shape
+        
+        # Convert normalized coordinates to pixel coordinates
+        points = []
+        for landmark in hand_landmarks:
+            x = int(landmark['x'] * w)
+            y = int(landmark['y'] * h)
+            points.append((x, y))
+            # Draw landmark point
+            cv2.circle(image, (x, y), 5, color, -1)
+            cv2.circle(image, (x, y), 7, (255, 255, 255), 2)
+        
+        # Draw connections
+        for connection in HAND_CONNECTIONS:
+            start_idx, end_idx = connection
+            if start_idx < len(points) and end_idx < len(points):
+                cv2.line(image, points[start_idx], points[end_idx], color, 2)
+        
+        return image
         
     def process_frame(self, frame: np.ndarray) -> Tuple[np.ndarray, Optional[List]]:
         """
@@ -53,28 +94,26 @@ class HandPoseEstimator:
         # Convert BGR to RGB
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         
+        # Create MediaPipe Image
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+        
         # Process the frame
-        results = self.hands.process(rgb_frame)
+        if self.running_mode == vision.RunningMode.VIDEO:
+            self.frame_timestamp_ms += 33  # ~30 fps
+            results = self.detector.detect_for_video(mp_image, self.frame_timestamp_ms)
+        else:
+            results = self.detector.detect(mp_image)
         
         # Create a copy for annotation
         annotated_frame = frame.copy()
         
         hand_landmarks_list = []
         
-        if results.multi_hand_landmarks:
-            for hand_landmarks in results.multi_hand_landmarks:
-                # Draw hand landmarks
-                self.mp_drawing.draw_landmarks(
-                    annotated_frame,
-                    hand_landmarks,
-                    self.mp_hands.HAND_CONNECTIONS,
-                    self.mp_drawing_styles.get_default_hand_landmarks_style(),
-                    self.mp_drawing_styles.get_default_hand_connections_style()
-                )
-                
+        if results.hand_landmarks:
+            for hand_landmarks in results.hand_landmarks:
                 # Extract 3D coordinates
                 landmarks_3d = []
-                for landmark in hand_landmarks.landmark:
+                for landmark in hand_landmarks:
                     landmarks_3d.append({
                         'x': landmark.x,
                         'y': landmark.y,
@@ -83,6 +122,9 @@ class HandPoseEstimator:
                     })
                 
                 hand_landmarks_list.append(landmarks_3d)
+                
+                # Draw landmarks
+                self.draw_landmarks(annotated_frame, landmarks_3d)
         
         return annotated_frame, hand_landmarks_list if hand_landmarks_list else None
     
@@ -111,7 +153,7 @@ class HandPoseEstimator:
     
     def release(self):
         """Release resources."""
-        self.hands.close()
+        self.detector.close()
 
 
 def main():
