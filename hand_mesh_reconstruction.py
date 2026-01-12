@@ -9,6 +9,7 @@ from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 import numpy as np
 from typing import Optional, List, Tuple
+from scipy.spatial import Delaunay
 
 
 # Hand landmark connections for drawing
@@ -123,7 +124,7 @@ class HandMeshReconstructor:
                 zip(results.hand_landmarks, results.hand_world_landmarks)
             ):
                 # Extract handedness (left or right)
-                handedness = "Unknown"
+                handedness = "Right"
                 if results.handedness and idx < len(results.handedness):
                     handedness = results.handedness[idx][0].category_name
                 
@@ -151,7 +152,7 @@ class HandMeshReconstructor:
                     'world_landmarks': world_landmarks,
                     'landmark_count': len(screen_landmarks)
                 })
-                
+
                 # Draw the hand mesh with connections
                 self.draw_landmarks(annotated_frame, screen_landmarks, 
                                   color=(255, 0, 0) if handedness == "Left" else (0, 0, 255))
@@ -179,14 +180,15 @@ class HandMeshReconstructor:
     
     def draw_3d_mesh(self, frame: np.ndarray, mesh_data: dict) -> np.ndarray:
         """
-        Draw enhanced 3D mesh visualization with depth information.
+        Draw hand mesh using Delaunay triangulation on 2D landmarks.
+        Creates a dense triangular mesh overlay for better visualization.
         
         Args:
             frame: Input frame
             mesh_data: Mesh data from reconstruct_mesh
             
         Returns:
-            Frame with enhanced mesh visualization
+            Frame with Delaunay mesh overlay
         """
         if not mesh_data or 'hands' not in mesh_data:
             return frame
@@ -194,34 +196,48 @@ class HandMeshReconstructor:
         h, w, _ = frame.shape
         
         for hand_info in mesh_data['hands']:
-            landmarks = hand_info['screen_landmarks']
             handedness = hand_info['handedness']
-            
-            # Color based on handedness
             base_color = (255, 100, 100) if handedness == "Left" else (100, 100, 255)
             
-            # Draw filled mesh triangles for better visualization
-            points = []
-            for lm in landmarks:
-                x = int(lm['x'] * w)
-                y = int(lm['y'] * h)
-                points.append([x, y])
+            # Get 2D screen landmarks
+            landmarks_2d = np.array([
+                [int(lm['x'] * w), int(lm['y'] * h)]
+                for lm in hand_info['screen_landmarks']
+            ], dtype=np.int32)
             
-            points = np.array(points, dtype=np.int32)
-            
-            # Draw palm area as filled polygon
-            palm_indices = [0, 1, 5, 9, 13, 17]
-            if len(points) >= max(palm_indices):
-                palm_points = points[palm_indices]
+            # Compute Delaunay triangulation on 2D landmarks
+            try:
+                tri = Delaunay(landmarks_2d.astype(np.float32))
+                triangles = tri.simplices  # (N, 3) indices
+                
+                # Draw filled triangles for dense mesh effect
                 overlay = frame.copy()
-                cv2.fillPoly(overlay, [palm_points], base_color)
-                frame = cv2.addWeighted(frame, 0.7, overlay, 0.3, 0)
+                for simplex in triangles:
+                    pts = landmarks_2d[simplex]
+                    cv2.fillPoly(overlay, [pts], base_color)
+                
+                # Blend overlay with frame
+                frame = cv2.addWeighted(frame, 0.6, overlay, 0.4, 0)
+                
+                # Draw wireframe edges
+                for simplex in triangles:
+                    for i in range(3):
+                        p1 = tuple(landmarks_2d[simplex[i]])
+                        p2 = tuple(landmarks_2d[simplex[(i + 1) % 3]])
+                        cv2.line(frame, p1, p2, (255, 255, 255), 1)
+                
+            except Exception as e:
+                # Fallback: just draw skeleton if Delaunay fails
+                print(f"Delaunay failed: {e}")
             
-            # Draw label
-            wrist = points[0]
-            label = f"{handedness} Hand"
-            cv2.putText(frame, label, (wrist[0], wrist[1] - 10),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, base_color, 2)
+            # Draw landmarks on top
+            for lm in landmarks_2d:
+                cv2.circle(frame, tuple(lm), 4, (0, 255, 0), -1)
+            
+            # Label
+            wrist_px = tuple(landmarks_2d[0])
+            cv2.putText(frame, f"{handedness} Hand Mesh", (wrist_px[0], wrist_px[1] - 12),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, base_color, 2)
         
         return frame
     
