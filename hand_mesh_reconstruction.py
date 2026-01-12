@@ -9,7 +9,6 @@ from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 import numpy as np
 from typing import Optional, List, Tuple
-from scipy.spatial import Delaunay
 
 
 # Hand landmark connections for drawing
@@ -180,15 +179,14 @@ class HandMeshReconstructor:
     
     def draw_3d_mesh(self, frame: np.ndarray, mesh_data: dict) -> np.ndarray:
         """
-        Draw hand mesh using Delaunay triangulation on 2D landmarks.
-        Creates a dense triangular mesh overlay for better visualization.
+        Draw hand skeleton from landmarks (simplified visualization).
         
         Args:
             frame: Input frame
             mesh_data: Mesh data from reconstruct_mesh
             
         Returns:
-            Frame with Delaunay mesh overlay
+            Frame with hand skeleton overlay
         """
         if not mesh_data or 'hands' not in mesh_data:
             return frame
@@ -199,44 +197,24 @@ class HandMeshReconstructor:
             handedness = hand_info['handedness']
             base_color = (255, 100, 100) if handedness == "Left" else (100, 100, 255)
             
-            # Get 2D screen landmarks
+            # Draw MediaPipe landmarks
             landmarks_2d = np.array([
                 [int(lm['x'] * w), int(lm['y'] * h)]
                 for lm in hand_info['screen_landmarks']
             ], dtype=np.int32)
             
-            # Compute Delaunay triangulation on 2D landmarks
-            try:
-                tri = Delaunay(landmarks_2d.astype(np.float32))
-                triangles = tri.simplices  # (N, 3) indices
-                
-                # Draw filled triangles for dense mesh effect
-                overlay = frame.copy()
-                for simplex in triangles:
-                    pts = landmarks_2d[simplex]
-                    cv2.fillPoly(overlay, [pts], base_color)
-                
-                # Blend overlay with frame
-                frame = cv2.addWeighted(frame, 0.6, overlay, 0.4, 0)
-                
-                # Draw wireframe edges
-                for simplex in triangles:
-                    for i in range(3):
-                        p1 = tuple(landmarks_2d[simplex[i]])
-                        p2 = tuple(landmarks_2d[simplex[(i + 1) % 3]])
-                        cv2.line(frame, p1, p2, (255, 255, 255), 1)
-                
-            except Exception as e:
-                # Fallback: just draw skeleton if Delaunay fails
-                print(f"Delaunay failed: {e}")
-            
-            # Draw landmarks on top
             for lm in landmarks_2d:
-                cv2.circle(frame, tuple(lm), 4, (0, 255, 0), -1)
+                cv2.circle(frame, tuple(lm), 5, (0, 255, 0), -1)
+            
+            # Draw connections
+            for connection in self.hand_connections:
+                start_idx, end_idx = connection
+                if start_idx < len(landmarks_2d) and end_idx < len(landmarks_2d):
+                    cv2.line(frame, tuple(landmarks_2d[start_idx]), tuple(landmarks_2d[end_idx]), base_color, 2)
             
             # Label
             wrist_px = tuple(landmarks_2d[0])
-            cv2.putText(frame, f"{handedness} Hand Mesh", (wrist_px[0], wrist_px[1] - 12),
+            cv2.putText(frame, f"{handedness} Hand (21 landmarks)", (wrist_px[0], wrist_px[1] - 12),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, base_color, 2)
         
         return frame
